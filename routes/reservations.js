@@ -2,7 +2,7 @@ const express = require('express');
 const Joi = require('joi');
 const { getPool } = require('../db/init');
 const { authenticateToken, requireAdmin, requireOwnershipOrAdmin } = require('../middleware/auth');
-const { sendReservationSMS, sendCancellationSMS, sendPriorityReservationSMS } = require('../services/sendSMS');
+const { sendReservationSMS, sendSingleReservationSMS, sendCancellationSMS, sendPriorityReservationSMS } = require('../services/sendSMS');
 
 const router = express.Router();
 
@@ -54,73 +54,117 @@ router.post('/', authenticateToken, async (req, res) => {
     const { salle_id, date, heure_debut, heure_fin, motif } = value;
     const pool = getPool();
 
-    // Vérifier que la date n'est pas dans le passé
-    const reservationDate = new Date(date);
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    
-    if (reservationDate < today) {
-      return res.status(400).json({ error: 'Impossible de réserver dans le passé' });
-    }
+    await pool.query('BEGIN');
 
-    // Vérifier que l'heure de fin est après l'heure de début
-    if (heure_debut >= heure_fin) {
-      return res.status(400).json({ error: 'L\'heure de fin doit être après l\'heure de début' });
-    }
-
-    // Vérifier que la salle existe et est disponible
-    const salleResult = await pool.query(
-      'SELECT nom, statut FROM salles WHERE id = $1',
-      [salle_id]
-    );
-
-    if (salleResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Salle non trouvée' });
-    }
-
-    if (salleResult.rows[0].statut !== 'disponible') {
-      return res.status(400).json({ error: 'Salle non disponible' });
-    }
-
-    // Vérifier les conflits de réservation
-    const hasConflict = await checkReservationConflict(pool, salle_id, date, heure_debut, heure_fin);
-    if (hasConflict) {
-      return res.status(409).json({ error: 'Créneau déjà réservé' });
-    }
-
-    // Créer la réservation
-    const result = await pool.query(`
-      INSERT INTO reservations (utilisateur_id, salle_id, date, heure_debut, heure_fin, motif)
-      VALUES ($1, $2, $3, $4, $5, $6)
-      RETURNING id, date, heure_debut, heure_fin, motif, created_at
-    `, [req.user.id, salle_id, date, heure_debut, heure_fin, motif]);
-
-    const reservation = result.rows[0];
-
-    // Envoyer SMS de confirmation
     try {
-      await sendReservationSMS(
-        req.user.telephone,
-        req.user.nom,
-        salleResult.rows[0].nom,
-        new Date(date).toLocaleDateString('fr-FR'),
-        heure_debut,
-        heure_fin
-      );
-    } catch (smsError) {
-      console.error('Erreur envoi SMS:', smsError);
-      // Ne pas faire échouer la réservation si le SMS échoue
-    }
-
-    res.status(201).json({
-      message: 'Réservation créée avec succès',
-      reservation: {
-        ...reservation,
-        salle_nom: salleResult.rows[0].nom,
-        utilisateur_nom: req.user.nom
+      // Vérifier que la date n'est pas dans le passé
+      const reservationDate = new Date(date);
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      
+      if (reservationDate < today) {
+        throw new Error('Impossible de réserver dans le passé');
       }
-    });
 
+      // Vérifier que l'heure de fin est après l'heure de début
+      const startTimeMinutes = parseInt(heure_debut.split(':')[0]) * 60 + parseInt(heure_debut.split(':')[1]);
+      const endTimeMinutes = parseInt(heure_fin.split(':')[0]) * 60 + parseInt(heure_fin.split(':')[1]);
+      if (endTimeMinutes < startTimeMinutes + 60) {
+        throw new Error('L\'heure de fin doit être au moins 1 heure après l\'heure de début');
+      }
+
+      // Vérifier que la salle existe et est disponible
+      const salleResult = await pool.query(
+        'SELECT nom, statut FROM salles WHERE id = $1',
+        [salle_id]
+      );
+
+      if (salleResult.rows.length === 0) {
+        throw new Error('Salle non trouvée');
+      }
+
+      if (salleResult.rows[0].statut !== 'disponible') {
+        throw new Error('Salle non disponible');
+      }
+
+      // Vérifier les conflits de réservation
+      const hasConflict = await checkReservationConflict(pool, salle_id, date, heure_debut, heure_fin);
+      if (hasConflict) {
+        throw new Error('Créneau déjà réservé');
+      }
+
+      // Formater les heures pour PostgreSQL
+      const formattedHeureDebut = `${heure_debut}:00`;
+      const formattedHeureFin = `${heure_fin}:00`;
+
+      // Créer la réservation
+      const result = await pool.query(`
+        INSERT INTO reservations (utilisateur_id, salle_id, date, heure_debut, heure_fin, motif)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING id, date, heure_debut, heure_fin, motif, created_at
+      `, [req.user.id, salle_id, date, formattedHeureDebut, formattedHeureFin, motif]);
+
+      const reservation = result.rows[0];
+      let smsStatus = true;
+      let notificationStatus = true;
+
+      // Envoyer SMS de confirmation à tous les utilisateurs
+      let smsResult;
+      try {
+        smsResult = await sendReservationSMS(
+          salleResult.rows[0].nom,
+          new Date(date).toLocaleDateString('fr-FR'),
+          heure_debut,
+          heure_fin
+        );
+        if (!smsResult.success) {
+          smsStatus = false;
+        }
+      } catch (smsError) {
+        console.error('Erreur envoi SMS:', smsError);
+        smsStatus = false;
+      }
+
+      // Enregistrer la notification pour l'utilisateur qui a créé la réservation
+      try {
+        await pool.query(`
+          INSERT INTO notifications (utilisateur_id, reservation_id, message, type, lu)
+          VALUES ($1, $2, $3, $4, $5)
+        `, [
+          req.user.id,
+          reservation.id,
+          `Réservation confirmée pour ${salleResult.rows[0].nom} le ${new Date(date).toLocaleDateString('fr-FR')} de ${heure_debut} à ${heure_fin}`,
+          smsStatus ? 'sms_envoye' : 'sms_echec',
+          false
+        ]);
+      } catch (notificationError) {
+        console.error('Erreur enregistrement notification:', notificationError);
+        notificationStatus = false;
+      }
+
+      await pool.query('COMMIT');
+
+      res.status(201).json({
+        message: 'Réservation créée avec succès',
+        reservation: {
+          ...reservation,
+          salle_nom: salleResult.rows[0].nom,
+          utilisateur_nom: req.user.nom
+        },
+        smsStatus,
+        smsDetails: smsResult.summary,
+        notificationStatus
+      });
+    } catch (error) {
+      await pool.query('ROLLBACK');
+      res.status(
+        error.message === 'Salle non trouvée' ? 404 :
+        error.message === 'Créneau déjà réservé' ? 409 :
+        error.message === 'Salle non disponible' ? 400 :
+        error.message === 'Impossible de réserver dans le passé' ? 400 :
+        error.message === 'L\'heure de fin doit être au moins 1 heure après l\'heure de début' ? 400 : 500
+      ).json({ error: error.message || 'Erreur interne du serveur' });
+    }
   } catch (error) {
     console.error('Erreur lors de la création de la réservation:', error);
     res.status(500).json({ error: 'Erreur interne du serveur' });
@@ -151,7 +195,6 @@ router.get('/mes-reservations', authenticateToken, async (req, res) => {
     res.json({
       reservations: result.rows
     });
-
   } catch (error) {
     console.error('Erreur lors de la récupération des réservations:', error);
     res.status(500).json({ error: 'Erreur interne du serveur' });
@@ -185,7 +228,6 @@ router.get('/all', authenticateToken, requireAdmin, async (req, res) => {
     res.json({
       reservations: result.rows
     });
-
   } catch (error) {
     console.error('Erreur lors de la récupération des réservations:', error);
     res.status(500).json({ error: 'Erreur interne du serveur' });
@@ -197,6 +239,8 @@ router.delete('/:id', authenticateToken, async (req, res) => {
   try {
     const reservationId = parseInt(req.params.id);
     const pool = getPool();
+
+    await pool.query('BEGIN');
 
     // Récupérer les détails de la réservation
     const result = await pool.query(`
@@ -212,6 +256,7 @@ router.delete('/:id', authenticateToken, async (req, res) => {
     `, [reservationId]);
 
     if (result.rows.length === 0) {
+      await pool.query('ROLLBACK');
       return res.status(404).json({ error: 'Réservation non trouvée' });
     }
 
@@ -219,11 +264,13 @@ router.delete('/:id', authenticateToken, async (req, res) => {
 
     // Vérifier les permissions (propriétaire ou admin)
     if (req.user.role !== 'admin' && reservation.utilisateur_id !== req.user.id) {
+      await pool.query('ROLLBACK');
       return res.status(403).json({ error: 'Accès non autorisé' });
     }
 
     // Vérifier que la réservation peut être annulée
     if (reservation.statut !== 'active') {
+      await pool.query('ROLLBACK');
       return res.status(400).json({ error: 'Cette réservation ne peut pas être annulée' });
     }
 
@@ -233,9 +280,12 @@ router.delete('/:id', authenticateToken, async (req, res) => {
       ['annulee', reservationId]
     );
 
+    let smsStatus = true;
+    let notificationStatus = true;
+
     // Envoyer SMS d'annulation
     try {
-      await sendCancellationSMS(
+      const smsResult = await sendCancellationSMS(
         reservation.utilisateur_telephone,
         reservation.utilisateur_nom,
         reservation.salle_nom,
@@ -243,13 +293,40 @@ router.delete('/:id', authenticateToken, async (req, res) => {
         reservation.heure_debut,
         reservation.heure_fin
       );
+      if (!smsResult.success) {
+        smsStatus = false;
+      }
     } catch (smsError) {
       console.error('Erreur envoi SMS:', smsError);
+      smsStatus = false;
     }
 
-    res.json({ message: 'Réservation annulée avec succès' });
+    // Enregistrer la notification
+    try {
+      await pool.query(`
+        INSERT INTO notifications (utilisateur_id, reservation_id, message, type, lu)
+        VALUES ($1, $2, $3, $4, $5)
+      `, [
+        reservation.utilisateur_id,
+        reservation.id,
+        `Réservation annulée pour ${reservation.salle_nom} le ${new Date(reservation.date).toLocaleDateString('fr-FR')} de ${reservation.heure_debut} à ${reservation.heure_fin}`,
+        smsStatus ? 'sms_envoye' : 'sms_echec',
+        false
+      ]);
+    } catch (notificationError) {
+      console.error('Erreur enregistrement notification:', notificationError);
+      notificationStatus = false;
+    }
 
+    await pool.query('COMMIT');
+
+    res.json({
+      message: 'Réservation annulée avec succès',
+      smsStatus,
+      notificationStatus
+    });
   } catch (error) {
+    await pool.query('ROLLBACK');
     console.error('Erreur lors de l\'annulation de la réservation:', error);
     res.status(500).json({ error: 'Erreur interne du serveur' });
   }
@@ -272,6 +349,36 @@ router.post('/prioritaire', authenticateToken, requireAdmin, async (req, res) =>
     await pool.query('BEGIN');
 
     try {
+      // Vérifier que la date n'est pas dans le passé
+      const reservationDate = new Date(date);
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      
+      if (reservationDate < today) {
+        throw new Error('Impossible de réserver dans le passé');
+      }
+
+      // Vérifier que l'heure de fin est après l'heure de début
+      const startTimeMinutes = parseInt(heure_debut.split(':')[0]) * 60 + parseInt(heure_debut.split(':')[1]);
+      const endTimeMinutes = parseInt(heure_fin.split(':')[0]) * 60 + parseInt(heure_fin.split(':')[1]);
+      if (endTimeMinutes < startTimeMinutes + 60) {
+        throw new Error('L\'heure de fin doit être au moins 1 heure après l\'heure de début');
+      }
+
+      // Vérifier que la salle existe et est disponible
+      const salleResult = await pool.query(
+        'SELECT nom, statut FROM salles WHERE id = $1',
+        [salle_id]
+      );
+
+      if (salleResult.rows.length === 0) {
+        throw new Error('Salle non trouvée');
+      }
+
+      if (salleResult.rows[0].statut !== 'disponible') {
+        throw new Error('Salle non disponible');
+      }
+
       // Récupérer les réservations en conflit
       const conflictResult = await pool.query(`
         SELECT 
@@ -292,6 +399,9 @@ router.post('/prioritaire', authenticateToken, requireAdmin, async (req, res) =>
           )
       `, [salle_id, date, heure_debut, heure_fin]);
 
+      let smsStatus = true;
+      let notificationStatus = true;
+
       // Annuler les réservations en conflit
       if (conflictResult.rows.length > 0) {
         const conflictIds = conflictResult.rows.map(r => r.id);
@@ -303,7 +413,7 @@ router.post('/prioritaire', authenticateToken, requireAdmin, async (req, res) =>
         // Envoyer SMS aux utilisateurs concernés
         for (const conflict of conflictResult.rows) {
           try {
-            await sendPriorityReservationSMS(
+            const smsResult = await sendPriorityReservationSMS(
               conflict.utilisateur_telephone,
               conflict.utilisateur_nom,
               conflict.salle_nom,
@@ -311,27 +421,49 @@ router.post('/prioritaire', authenticateToken, requireAdmin, async (req, res) =>
               conflict.heure_debut,
               conflict.heure_fin
             );
+            if (!smsResult.success) {
+              smsStatus = false;
+            }
+
+            // Enregistrer la notification
+            try {
+              await pool.query(`
+                INSERT INTO notifications (utilisateur_id, reservation_id, message, type, lu)
+                VALUES ($1, $2, $3, $4, $5)
+              `, [
+                conflict.utilisateur_id,
+                conflict.id,
+                `Réservation annulée pour ${conflict.salle_nom} le ${new Date(conflict.date).toLocaleDateString('fr-FR')} de ${conflict.heure_debut} à ${conflict.heure_fin} (réservation prioritaire)`,
+                smsResult.success ? 'sms_envoye' : 'sms_echec',
+                false
+              ]);
+            } catch (notificationError) {
+              console.error('Erreur enregistrement notification:', notificationError);
+              notificationStatus = false;
+            }
           } catch (smsError) {
             console.error('Erreur envoi SMS:', smsError);
+            smsStatus = false;
           }
         }
       }
+
+      // Formater les heures pour PostgreSQL
+      const formattedHeureDebut = `${heure_debut}:00`;
+      const formattedHeureFin = `${heure_fin}:00`;
 
       // Créer la réservation prioritaire
       const result = await pool.query(`
         INSERT INTO reservations (utilisateur_id, salle_id, date, heure_debut, heure_fin, motif)
         VALUES ($1, $2, $3, $4, $5, $6)
         RETURNING id, date, heure_debut, heure_fin, motif, created_at
-      `, [req.user.id, salle_id, date, heure_debut, heure_fin, motif]);
+      `, [req.user.id, salle_id, date, formattedHeureDebut, formattedHeureFin, motif]);
 
-      // Récupérer le nom de la salle
-      const salleResult = await pool.query('SELECT nom FROM salles WHERE id = $1', [salle_id]);
-
-      await pool.query('COMMIT');
+      const reservation = result.rows[0];
 
       // Envoyer SMS de confirmation à l'admin
       try {
-        await sendReservationSMS(
+        const smsResult = await sendSingleReservationSMS(
           req.user.telephone,
           req.user.nom,
           salleResult.rows[0].nom,
@@ -339,21 +471,54 @@ router.post('/prioritaire', authenticateToken, requireAdmin, async (req, res) =>
           heure_debut,
           heure_fin
         );
+        if (!smsResult.success) {
+          smsStatus = false;
+        }
+
+        // Enregistrer la notification
+        try {
+          await pool.query(`
+            INSERT INTO notifications (utilisateur_id, reservation_id, message, type, lu)
+            VALUES ($1, $2, $3, $4, $5)
+          `, [
+            req.user.id,
+            reservation.id,
+            `Réservation prioritaire confirmée pour ${salleResult.rows[0].nom} le ${new Date(date).toLocaleDateString('fr-FR')} de ${heure_debut} à ${heure_fin}`,
+            smsResult.success ? 'sms_envoye' : 'sms_echec',
+            false
+          ]);
+        } catch (notificationError) {
+          console.error('Erreur enregistrement notification:', notificationError);
+          notificationStatus = false;
+        }
       } catch (smsError) {
         console.error('Erreur envoi SMS:', smsError);
+        smsStatus = false;
       }
+
+      await pool.query('COMMIT');
 
       res.status(201).json({
         message: 'Réservation prioritaire créée avec succès',
-        reservation: result.rows[0],
-        reservations_annulees: conflictResult.rows.length
+        reservation: {
+          ...reservation,
+          salle_nom: salleResult.rows[0].nom,
+          utilisateur_nom: req.user.nom
+        },
+        reservations_annulees: conflictResult.rows.length,
+        smsStatus,
+        notificationStatus
       });
-
     } catch (error) {
       await pool.query('ROLLBACK');
-      throw error;
+      res.status(
+        error.message === 'Salle non trouvée' ? 404 :
+        error.message === 'Créneau déjà réservé' ? 409 :
+        error.message === 'Salle non disponible' ? 400 :
+        error.message === 'Impossible de réserver dans le passé' ? 400 :
+        error.message === 'L\'heure de fin doit être au moins 1 heure après l\'heure de début' ? 400 : 500
+      ).json({ error: error.message || 'Erreur interne du serveur' });
     }
-
   } catch (error) {
     console.error('Erreur lors de la réservation prioritaire:', error);
     res.status(500).json({ error: 'Erreur interne du serveur' });
@@ -390,7 +555,6 @@ router.get('/stats', authenticateToken, requireAdmin, async (req, res) => {
       statistiques: stats.rows[0],
       salles_populaires: sallesPopulaires.rows
     });
-
   } catch (error) {
     console.error('Erreur lors de la récupération des statistiques:', error);
     res.status(500).json({ error: 'Erreur interne du serveur' });
